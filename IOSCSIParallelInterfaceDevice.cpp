@@ -97,7 +97,8 @@ enum
 	kWorldWideNameDataSize 		= 8,
 	kAddressIdentifierDataSize 	= 3,
 	kALPADataSize				= 1,
-	kSASAddressDataSize			= 8
+	kSASAddressDataSize			= 8,
+	kSCSIPortIdentifierDataSize = 8
 };
 
 
@@ -127,7 +128,7 @@ IOSCSIParallelInterfaceDevice::SetInitialTargetProperties (
 	setProperty ( kIOPropertyProtocolCharacteristicsKey, protocolDict );
 	protocolDict->release ( );
 	protocolDict = NULL;
-	
+		
 	// Set the properties from the dictionary
 	value = properties->getObject ( kIOPropertyFibreChannelNodeWorldWideNameKey );
 	SetTargetProperty ( kIOPropertyFibreChannelNodeWorldWideNameKey, value );
@@ -190,6 +191,9 @@ IOSCSIParallelInterfaceDevice::start ( IOService * provider )
 	result = fController->InitializeTargetForID ( fTargetIdentifier );
 	require ( result, CONTROLLER_INIT_FAILURE );
 	
+	// Check if controller supports Multipathing
+	fMultiPathSupport = fController->DoesHBASupportMultiPathing ( );
+	
 	// Setup power management for this object.
 	InitializePowerManagement ( provider );
 	
@@ -214,7 +218,7 @@ IOSCSIParallelInterfaceDevice::start ( IOService * provider )
 		{
 			
 			protocolDict->setObject ( kIOPropertySCSITargetIdentifierKey, targetID );
-			
+						
 			// Set the Unit number used to build the device tree path
 			setProperty ( kIOPropertyIOUnitKey, targetID );
 			
@@ -465,20 +469,28 @@ IOSCSIParallelInterfaceDevice::InitTarget (
 							IORegistryEntry *			entry )
 {
 	
-	OSObject *	value 	= NULL;
-	bool		result	= false;
+	bool	result	= false;
 	
 	result = super::init ( 0 );
 	require ( result, ERROR_EXIT );
 	
+	queue_init ( &fOutstandingTaskList );
+	queue_init ( &fResendTaskList );
+	
+	// Allocate the lock for the Task Queue
+	fQueueLock = IOSimpleLockAlloc ( );
+	require_nonzero ( fQueueLock, ERROR_EXIT );
+	
 	if ( entry != NULL )
 	{
+		
+		OSObject *	value = NULL;
 		
 		lockForArbitration ( );
 		result = attachToParent ( entry, gIODTPlane );
 		unlockForArbitration ( );
 		
-		require ( result, ERROR_EXIT );
+		require ( result, ATTACH_TO_PARENT_FAILURE );
 		
 		value = entry->copyProperty ( kIODeviceLocationKey );
 		if ( value != NULL )
@@ -492,14 +504,12 @@ IOSCSIParallelInterfaceDevice::InitTarget (
 	fHBADataSize		= sizeOfHBAData;
 	fTargetIdentifier	= targetID;
 	
-	queue_init ( &fOutstandingTaskList );
-	queue_init ( &fResendTaskList );
-	
-	// Allocate the lock for the Task Queue
-	fQueueLock = IOSimpleLockAlloc ( );
-	require_nonzero ( fQueueLock, ERROR_EXIT );
-	
 	fAllowResends = true;
+	
+	// Set Multipath support to 'true' by default. 
+	// The HBA driver will be queried and this will be
+	// updated.
+	fMultiPathSupport = true;
 	
 	if ( sizeOfHBAData != 0 )
 	{
@@ -515,6 +525,7 @@ IOSCSIParallelInterfaceDevice::InitTarget (
 	
 	
 HBA_DATA_ALLOC_FAILURE:
+ATTACH_TO_PARENT_FAILURE:
 	
 	
 	require_nonzero_quiet ( fQueueLock, ERROR_EXIT );
@@ -960,6 +971,7 @@ IOSCSIParallelInterfaceDevice::SetTargetProperty (
 		require_nonzero ( data, ErrorExit );
 		require ( ( data->getLength ( ) == kWorldWideNameDataSize ), ErrorExit );
 		result = protocolDict->setObject ( key, value );
+		result = protocolDict->setObject ( kIOPropertySCSIPortIdentifierKey, value );
 		
 	}
 	
@@ -1009,6 +1021,7 @@ IOSCSIParallelInterfaceDevice::SetTargetProperty (
 		require_nonzero ( data, ErrorExit );
 		require ( ( data->getLength ( ) == kSASAddressDataSize ), ErrorExit );
 		result = protocolDict->setObject ( key, value );
+		result = protocolDict->setObject ( kIOPropertySCSIPortIdentifierKey, value );
 		
 		snprintf ( name, sizeof ( name ), "SAS Target %016qX", OSSwapHostToBigInt64 ( *( UInt64 * ) data->getBytesNoCopy ( ) ) );
 		setName ( name, gIOServicePlane );
@@ -1018,13 +1031,10 @@ IOSCSIParallelInterfaceDevice::SetTargetProperty (
 	else if ( strcmp ( key, kIOPropertyRetryCountKey ) == 0 )
 	{
 		
-		OSNumber * number = OSDynamicCast ( OSNumber, value );
-		
-		require_nonzero ( number, ErrorExit );
 		result = protocolDict->setObject ( key, value );
 		
 	}
-	
+		
 	setProperty ( kIOPropertyProtocolCharacteristicsKey, protocolDict );
 	protocolDict->release ( );
 	protocolDict = NULL;
@@ -1392,6 +1402,27 @@ IOSCSIParallelInterfaceDevice::IsProtocolServiceSupported (
 		case kSCSIProtocolFeature_ProtocolAlwaysReportsAutosenseData:
 		{
 			isSupported = fController->DoesHBAPerformAutoSense ( );
+		}
+		break;
+		
+		case kSCSIProtocolFeature_HierarchicalLogicalUnits:
+		{
+
+			OSBoolean *     obj = NULL;
+
+			obj = OSDynamicCast ( OSBoolean, fController->getProperty ( kIOHierarchicalLogicalUnitSupportKey ) );
+
+			if ( ( obj != NULL ) && ( obj->isTrue ( ) ) )
+			{
+				isSupported = true;
+			}
+
+		}
+		break;
+
+		case kSCSIProtocolFeature_MultiPathing:
+		{
+			isSupported = fMultiPathSupport;
 		}
 		break;
 		
@@ -1812,11 +1843,7 @@ IOSCSIParallelInterfaceDevice::SendFromResendTaskList ( void )
 		// one on the queue.
 		continue;
 		
-	}
-	
-	
-Exit:
-	
+	}	
 	
 	fResendThreadScheduled = false;
 	

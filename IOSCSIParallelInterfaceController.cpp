@@ -99,9 +99,10 @@ OSDefineAbstractStructors ( IOSCSIParallelInterfaceController, IOService );
 
 enum
 {
-	kWorldWideNameDataSize 				= 8,
-	kAddressIdentifierDataSize 			= 3,
-	kALPADataSize						= 1
+	kWorldWideNameDataSize 		= 8,
+	kAddressIdentifierDataSize 	= 3,
+	kALPADataSize				= 1,
+	kSASAddressDataSize			= 8
 };
 
 enum
@@ -459,6 +460,20 @@ IOSCSIParallelInterfaceController::stop ( IOService * provider )
 	// Release all WorkLoop related resources
 	ReleaseWorkLoop ( );
 	
+	super::stop ( provider );
+	
+}
+
+
+
+//-----------------------------------------------------------------------------
+//	free - Frees resources.											[PROTECTED]
+//-----------------------------------------------------------------------------
+
+void
+IOSCSIParallelInterfaceController::free ( void )
+{
+	
 	if ( fDeviceLock != NULL )
 	{
 		
@@ -467,7 +482,7 @@ IOSCSIParallelInterfaceController::stop ( IOService * provider )
 		
 	}
 	
-	super::stop ( provider );
+	super::free ( );
 	
 }
 
@@ -483,8 +498,16 @@ IOSCSIParallelInterfaceController::willTerminate (
 	IOOptionBits		options )
 {
 	
+	SCSITargetIdentifier	index = 0;
+	
 	// Prevent any new requests from being sent to the controller.
 	fHBACanAcceptClientRequests = false;
+	
+	for ( index = 0; index < fHighestSupportedDeviceID; index++ )
+	{		
+		DestroyTargetForID ( index );
+	}
+	
 	return true;
 	
 }
@@ -637,6 +660,7 @@ IOSCSIParallelInterfaceController::SetHBAProperty (
 		require_nonzero ( data, ErrorExit );
 		require ( ( data->getLength ( ) == kWorldWideNameDataSize ), ErrorExit );
 		result = hbaDict->setObject ( key, value );
+		result = hbaDict->setObject ( kIOPropertySCSIPortIdentifierKey, value );
 		
 	}
 	
@@ -677,6 +701,18 @@ IOSCSIParallelInterfaceController::SetHBAProperty (
 	{
 		result = hbaDict->setObject ( key, value );
 	}
+	
+	else if ( strcmp ( key, kIOPropertySASAddressKey ) == 0 )
+	{
+		
+		OSData * data = OSDynamicCast ( OSData, value );
+		
+		require_nonzero ( data, ErrorExit );
+		require ( ( data->getLength ( ) == kSASAddressDataSize ), ErrorExit );
+		result = hbaDict->setObject ( key, value );
+		result = hbaDict->setObject ( kIOPropertySCSIPortIdentifierKey, value );
+		
+	}	
 	
 	else
 	{
@@ -1043,6 +1079,7 @@ IOSCSIParallelInterfaceController::AllocateSCSIParallelTasks ( void )
 	UInt64				mask			= 0;
 	OSNumber *			value			= NULL;
 	OSDictionary *		constraints		= NULL;
+	OSObject *			obj				= NULL;
 	
 	// Default alignment is 16-byte aligned, 32-bit memory only.
 	taskSize 	= ReportHBASpecificTaskDataSize ( );
@@ -1092,6 +1129,12 @@ IOSCSIParallelInterfaceController::AllocateSCSIParallelTasks ( void )
 	value = OSDynamicCast ( OSNumber, constraints->getObject ( kIOMinimumHBADataAlignmentMaskKey ) );
 	mask  = value->unsigned64BitValue ( );
 	
+	obj = constraints->getObject ( kIOHierarchicalLogicalUnitSupportKey );
+	if ( obj != NULL )
+	{
+		setProperty ( kIOHierarchicalLogicalUnitSupportKey, obj );
+	}
+
 	constraints->release ( );
 	constraints = NULL;
 	
@@ -2038,6 +2081,47 @@ IOSCSIParallelInterfaceController::DoesHBAPerformAutoSense ( void )
 
 
 //-----------------------------------------------------------------------------
+//	DoesHBASupportMultiPathing - Default implementation.			   [PUBLIC]
+//-----------------------------------------------------------------------------
+
+bool 
+IOSCSIParallelInterfaceController::DoesHBASupportMultiPathing ( void )
+{
+
+	OSString *		interface	= NULL;
+	OSDictionary *	dict		= NULL;
+	bool			result		= true;
+
+	
+	// Get Protocol Characteristics.
+	dict = OSDynamicCast ( OSDictionary, getProperty ( kIOPropertyProtocolCharacteristicsKey ) );
+	
+	if ( dict != NULL )
+	{
+	
+		interface = OSDynamicCast ( OSString, dict->getObject ( kIOPropertyPhysicalInterconnectTypeKey ) );
+		
+		if ( interface != NULL )
+		{
+		
+			if ( ( interface->isEqualTo ( kIOPropertyPhysicalInterconnectTypeSCSIParallel ) ) ||
+				( interface->isEqualTo ( kIOPropertyPhysicalInterconnectTypeSerialAttachedSCSI ) ) )
+			{
+	
+				// No Multipathing for parallel SCSI and SAS by default. 
+				result = false;
+	
+			}
+	
+		}
+		
+	}
+	
+	return result;
+}
+
+
+//-----------------------------------------------------------------------------
 //	ReportHBAConstraints - Default implementation.				 	   [PUBLIC]
 //-----------------------------------------------------------------------------
 
@@ -2348,7 +2432,7 @@ CopyProtocolCharacteristicsProperties ( OSDictionary * dict, IOService * service
 		{
 			
 			dict->setObject ( kIOPropertyPhysicalInterconnectTypeKey, string );
-			
+		
 		}
 		
 	}
@@ -2441,6 +2525,28 @@ IOSCSIParallelInterfaceController::GetLogicalUnitNumber (
 	return tempTask->GetLogicalUnitNumber ( );
 	
 }
+
+
+//-----------------------------------------------------------------------------
+//  GetLogicalUnitBytes - Gets SCSILogicalUnitBytes for task.		[PROTECTED]
+//-----------------------------------------------------------------------------
+void
+IOSCSIParallelInterfaceController::GetLogicalUnitBytes (
+							SCSIParallelTaskIdentifier      parallelTask,
+							SCSILogicalUnitBytes *          logicalUnitBytes )
+{
+
+	SCSIParallelTask *  tempTask = ( SCSIParallelTask * ) parallelTask;
+   
+	if ( tempTask == NULL )
+	{
+		return;
+	}
+   
+	return tempTask->GetLogicalUnitBytes ( logicalUnitBytes );
+   
+}
+
 
 
 //-----------------------------------------------------------------------------
@@ -3068,7 +3174,7 @@ IOSCSIParallelInterfaceController::GetHBATargetDataPointer (
 OSMetaClassDefineReservedUsed ( IOSCSIParallelInterfaceController,  1 );		// Used for DoesHBAPerformAutoSense
 OSMetaClassDefineReservedUsed ( IOSCSIParallelInterfaceController,  2 );		// Used for ReportHBAConstraints
 
-OSMetaClassDefineReservedUnused ( IOSCSIParallelInterfaceController,  3 );
+OSMetaClassDefineReservedUsed ( IOSCSIParallelInterfaceController,  3 );		// Used for DoesHBASupportMultiPathing
 OSMetaClassDefineReservedUnused ( IOSCSIParallelInterfaceController,  4 );
 OSMetaClassDefineReservedUnused ( IOSCSIParallelInterfaceController,  5 );
 OSMetaClassDefineReservedUnused ( IOSCSIParallelInterfaceController,  6 );
